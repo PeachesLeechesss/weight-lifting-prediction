@@ -1,0 +1,160 @@
+---
+title: "Predicting Weight-Lifting Exercise Quality"
+author: "Shyama Mohanty"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: false
+    number_sections: false
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 3.5)
+library(caret)
+library(randomForest)
+set.seed(2026)
+```
+
+## Executive summary
+
+This analysis predicts the manner in which six participants performed barbell lifts using wearable-sensor measurements. The outcome, `classe`, has five categories: A (correct execution) and B–E (four common mistakes). I remove identifier-like columns and predictors with missing values, then compare a classification tree with a random forest using a stratified holdout set and five-fold cross-validation. Random forests are selected because they capture nonlinear relationships and interactions and generally perform well with correlated sensor features. The final model is evaluated on held-out observations before being refitted to all labeled observations and applied to the 20 unlabeled test cases.
+
+## Background and data
+
+The data come from the Weight Lifting Exercise Dataset collected using accelerometers on the belt, forearm, arm, and dumbbell. The original dataset description is by Velloso et al. (2013), *Qualitative Activity Recognition of Weight Lifting Exercises*. The training file contains 19,622 labeled observations and the prediction file contains 20 cases. Each label represents one of five execution classes.
+
+## Data preparation
+
+```{r data}
+train_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url  <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+if (!file.exists("pml-training.csv"))
+  download.file(train_url, "pml-training.csv", mode = "wb")
+if (!file.exists("pml-testing.csv"))
+  download.file(test_url, "pml-testing.csv", mode = "wb")
+
+raw_train <- read.csv("pml-training.csv",
+                      na.strings = c("NA", "", "#DIV/0!"),
+                      stringsAsFactors = FALSE)
+raw_test <- read.csv("pml-testing.csv",
+                     na.strings = c("NA", "", "#DIV/0!"),
+                     stringsAsFactors = FALSE)
+
+dim(raw_train)
+dim(raw_test)
+table(raw_train$classe)
+```
+
+The first seven columns describe the row index, participant, timestamps, or window metadata rather than the sensor signals directly. These are excluded to reduce the risk of learning incidental identifiers. Columns that are incomplete in either dataset are removed, leaving the same predictors available for training and prediction. The outcome and test-case ID are retained separately.
+
+```{r clean}
+# Keep only columns fully observed in both data sets, then remove metadata.
+complete_train <- names(raw_train)[colSums(is.na(raw_train)) == 0]
+complete_test  <- names(raw_test)[colSums(is.na(raw_test)) == 0]
+predictor_names <- intersect(complete_train, complete_test)
+predictor_names <- setdiff(predictor_names, names(raw_train)[1:7])
+predictor_names <- setdiff(predictor_names, c("classe", "problem_id"))
+
+# Keep the outcome in the training data, but never as a test predictor.
+y <- factor(raw_train$classe)
+x <- raw_train[, predictor_names, drop = FALSE]
+test_x <- raw_test[, predictor_names, drop = FALSE]
+
+# Remove predictors with near-zero variance.
+nzv <- nearZeroVar(x)
+if (length(nzv) > 0) {
+  x <- x[, -nzv, drop = FALSE]
+  test_x <- test_x[, names(x), drop = FALSE]
+}
+```
+
+## Exploratory analysis
+
+```{r class-plot, fig.cap="Distribution of exercise classes in the labeled training data."}
+class_counts <- as.data.frame(table(y))
+names(class_counts) <- c("Class", "Count")
+barplot(class_counts$Count, names.arg = class_counts$Class,
+        xlab = "Exercise class", ylab = "Number of observations",
+        main = "Class distribution")
+```
+
+The class counts should be checked before fitting because a heavily imbalanced outcome can make overall accuracy misleading. Stratified partitioning preserves the approximate class proportions in the training and validation subsets.
+
+## Model development and validation
+
+I compare a classification tree (`rpart`) with a random forest (`rf`). A tree is interpretable but can be unstable and may miss complex boundaries. A random forest averages many trees built on bootstrap samples and random subsets of predictors, usually improving predictive accuracy and reducing variance. I use a 75% stratified training partition and a 25% holdout partition to estimate generalization performance. Five-fold cross-validation is used within the development partition for the random forest.
+
+```{r fit-models}
+set.seed(2026)
+idx <- createDataPartition(y, p = 0.75, list = FALSE)
+x_dev <- x[idx, , drop = FALSE]
+y_dev <- y[idx]
+x_hold <- x[-idx, , drop = FALSE]
+y_hold <- y[-idx]
+
+ctrl <- trainControl(method = "cv", number = 5,
+                     classProbs = FALSE, savePredictions = "final")
+
+set.seed(2026)
+tree_fit <- train(x = x_dev, y = y_dev, method = "rpart",
+                  trControl = ctrl, tuneLength = 10)
+
+set.seed(2026)
+rf_fit <- train(x = x_dev, y = y_dev, method = "rf",
+                trControl = ctrl, tuneLength = 3, ntree = 400)
+
+tree_pred <- predict(tree_fit, newdata = x_hold)
+rf_pred <- predict(rf_fit, newdata = x_hold)
+
+tree_cm <- confusionMatrix(tree_pred, y_hold)
+rf_cm <- confusionMatrix(rf_pred, y_hold)
+
+tree_cm
+rf_cm
+```
+
+The holdout accuracy and error rate are calculated as follows:
+
+```{r error-rates}
+tree_accuracy <- unname(tree_cm$overall["Accuracy"])
+rf_accuracy <- unname(rf_cm$overall["Accuracy"])
+results <- data.frame(
+  Model = c("Classification tree", "Random forest"),
+  Holdout_accuracy = c(tree_accuracy, rf_accuracy),
+  Estimated_out_of_sample_error = c(1 - tree_accuracy, 1 - rf_accuracy)
+)
+knitr::kable(results, digits = 4)
+```
+
+The expected out-of-sample error is estimated by the holdout misclassification rate, `1 - accuracy`. Cross-validation gives an additional estimate of performance on unseen data. These are estimates rather than guarantees: performance may vary with the split and random seed. I select the model with the higher holdout accuracy, considering cross-validation performance as supporting evidence.
+
+## Final model and 20 predictions
+
+After validation, the random forest is refitted on all labeled training observations and used to predict the 20 cases. This uses the labeled data efficiently after the model-selection step.
+
+```{r final-predictions}
+set.seed(2026)
+final_fit <- train(x = x, y = y, method = "rf",
+                   trControl = trainControl(method = "none"),
+                   tuneGrid = data.frame(mtry = rf_fit$bestTune$mtry),
+                   ntree = 400)
+
+final_predictions <- predict(final_fit, newdata = test_x)
+prediction_table <- data.frame(
+  problem_id = raw_test$problem_id,
+  predicted_classe = as.character(final_predictions)
+)
+knitr::kable(prediction_table)
+write.csv(prediction_table, "pml_test_predictions.csv", row.names = FALSE)
+```
+
+## Conclusion and limitations
+
+The random forest is used as the final model because it can represent nonlinear boundaries and interactions among sensor features without requiring a linear relationship between each predictor and the outcome. The holdout confusion matrix reveals which classes are most often confused; overall accuracy should be interpreted alongside class-level performance. Important limitations are that the sample includes only six participants, measurements from the same participant may be correlated, and random holdout validation does not fully measure performance on entirely new people. A participant-wise validation design would be a stronger test of generalization to unseen individuals.
+
+## Data source
+
+Velloso, E., Bulling, A., Gellersen, H., Ugulino, W., & Fuks, H. (2013). *Qualitative Activity Recognition of Weight Lifting Exercises*. Proceedings of the 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Dataset supplied for the course project: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv and https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv.
